@@ -216,6 +216,14 @@ hostile working directory cannot turn a build check into a denial of service:
 (512), `max_circuits` (64). Exceeding any of them is a fatal, typed failure —
 never a hang.
 
+Artifact declarations may include an optional integer `size_bytes` field.
+When present, the manifest tool compares it with the artifact's on-disk byte
+count before reading, hashing, or normalizing the artifact. Invalid, negative,
+or mismatched declarations fail explicitly. Manifests and lock declarations
+that omit `size_bytes` retain the legacy digest-only behavior. Generated
+manifests record the measured `size_bytes`, and drift comparison reports a
+size change when both manifests provide that field.
+
 ## Signals
 
 Both the script and the tool emit single-line JSON on **stderr**:

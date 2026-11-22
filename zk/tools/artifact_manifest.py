@@ -102,6 +102,10 @@ class BuildError(RuntimeError):
     """Fatal, non-recoverable condition. Carries no artifact content."""
 
 
+class ArtifactSizeMismatchError(BuildError):
+    """A lock-declared artifact size is invalid or differs from disk."""
+
+
 class ManifestVerificationError(BuildError):
     """Signature verification failed or required fields are missing.
 
@@ -371,6 +375,18 @@ def digest_artifact(declaration: dict, lock: Lock, root: Path) -> ArtifactResult
         return result
 
     size = target.stat().st_size
+    declared_size = declaration.get("size_bytes")
+    if declared_size is not None:
+        if type(declared_size) is not int or declared_size < 0:
+            raise ArtifactSizeMismatchError(
+                f"artifact {relative}: invalid declared size_bytes"
+            )
+        if declared_size != size:
+            raise ArtifactSizeMismatchError(
+                f"artifact {relative}: declared size {declared_size} bytes, "
+                f"actual size {size} bytes"
+            )
+
     if size > lock.limits.max_artifact_bytes:
         result.state = ArtifactState.OVERSIZE
         result.raw_bytes = size
@@ -389,6 +405,12 @@ def digest_artifact(declaration: dict, lock: Lock, root: Path) -> ArtifactResult
         result.state = ArtifactState.UNREADABLE
         signal("artifact.state", path=relative, state=result.state)
         return result
+
+    if declared_size is not None and len(data) != declared_size:
+        raise ArtifactSizeMismatchError(
+            f"artifact {relative}: declared size {declared_size} bytes, "
+            f"read size {len(data)} bytes"
+        )
 
     normalized = normalize(data, kind, lock)
 
@@ -558,6 +580,17 @@ def compare_manifests(expected: dict, actual: dict) -> list[str]:
         if after is None:
             findings.append(f"artifact {path}: missing from the rebuilt tree")
             continue
+        before_size = before.get("size_bytes")
+        after_size = after.get("size_bytes")
+        if (
+            before_size is not None
+            and after_size is not None
+            and before_size != after_size
+        ):
+            findings.append(
+                f"artifact {path}: size {before_size} -> {after_size}"
+            )
+
         if before.get("normalized_sha256") != after.get("normalized_sha256"):
             findings.append(
                 f"artifact {path}: normalized digest "
