@@ -320,8 +320,8 @@ def resolve_within_root(declared: str, root: Path) -> Path:
     raises :class:`ArtifactPathEscapeError` naming only the declared path and
     the root name — never the absolute host path.
     """
-    root_resolved = root.resolve()
     try:
+        root_resolved = root.resolve()
         resolved = (root_resolved / declared).resolve()
     except (OSError, RuntimeError) as exc:
         raise ArtifactPathEscapeError(
@@ -372,11 +372,7 @@ def digest_artifact(declaration: dict, lock: Lock, root: Path) -> ArtifactResult
         signal("artifact.state", path=relative, state=result.state, required=required)
         return result
 
-    # Re-resolve after the existence check: a symlink can be introduced between
-    # the containment check and the read, so the helper is called once more
-    # immediately before open() in the read below. The bounded error carries
-    # only the declared path (see resolve_within_root).
-
+    # Use the resolved path for subsequent filesystem operations.
     size = target.stat().st_size
     if size > lock.limits.max_artifact_bytes:
         result.state = ArtifactState.OVERSIZE
@@ -392,9 +388,6 @@ def digest_artifact(declaration: dict, lock: Lock, root: Path) -> ArtifactResult
 
     try:
         data = target.read_bytes()
-    except ArtifactPathEscapeError:
-        # Re-raise: an escape is a policy decision the caller must see.
-        raise
     except OSError:
         result.state = ArtifactState.UNREADABLE
         signal("artifact.state", path=relative, state=result.state)
@@ -830,11 +823,6 @@ def compare_published_to_targets(lock: Lock, root: Path) -> list[str]:
     for declaration in published_acir_declarations(lock):
         published_path = declaration["path"]
         target_path = published_to_build_target(published_path)
-        published = root / published_path
-        target = root / target_path
-        if not published.is_file() or not target.is_file():
-            continue
-
         published_decl = {
             "path": published_path,
             "kind": declaration.get("kind", "json"),
@@ -849,6 +837,12 @@ def compare_published_to_targets(lock: Lock, root: Path) -> list[str]:
         }
         published_result = digest_artifact(published_decl, lock, root)
         target_result = digest_artifact(target_decl, lock, root)
+
+        # Missing files are not drift: either side may await a later publish.
+        if published_result.state in (ArtifactState.MISSING, ArtifactState.SKIPPED):
+            continue
+        if target_result.state in (ArtifactState.MISSING, ArtifactState.SKIPPED):
+            continue
 
         if published_result.state != ArtifactState.DIGESTED:
             findings.append(
