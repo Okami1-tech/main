@@ -102,14 +102,15 @@ class BuildError(RuntimeError):
     """Fatal, non-recoverable condition. Carries no artifact content."""
 
 
-<<<<<<< HEAD
 class ArtifactPathEscapeError(BuildError):
     """A declared artifact path resolves outside the selected release directory.
 
     The message carries only the repo-relative *declared* path and the
     containing root — never the absolute host path — so the error is safe to
     surface in CI logs.
-=======
+    """
+
+
 class ManifestVerificationError(BuildError):
     """Signature verification failed or required fields are missing.
 
@@ -117,7 +118,6 @@ class ManifestVerificationError(BuildError):
     *before* any artifact bytes are read, so an unsigned or tampered release
     manifest can never reach a client. The message names only the failure
     reason — never artifact content or key material.
->>>>>>> upstream/main
     """
 
 
