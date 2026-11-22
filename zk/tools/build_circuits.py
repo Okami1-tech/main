@@ -667,7 +667,7 @@ def _generate_aggregator(
     repo_root: Path = REPO_ROOT,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> int:
-       batch_count = len(video_hashes)
+    batch_count = len(video_hashes)
     if batch_count < 1 or batch_count > 8:
         err = {
             "protocol": "harpocrates",
