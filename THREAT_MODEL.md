@@ -273,8 +273,8 @@ and `metadata_hash` for content they did not actually review.
 | An issuer read that does not complete is surfaced as `Issuer lookup unavailable` with no trust decision, never as a trusted or unknown issuer | `frontend/src/hooks/useIssuerTrust.ts` |
 
 **Control (#357):** The `revocation_witness` Merkle tree is protocol-bounded at
-`MAX_REVOCATION_WITNESS_DEPTH = 3` (`MAX_REVOCATION_LEAVES = 8`). The Noir
-circuit is fixed at this depth; host tooling (`zk/tools/revocation_depth.py`,
+`MAX_REVOCATION_WITNESS_DEPTH = 16` (`MAX_REVOCATION_LEAVES = 65536`). The Noir
+circuit is parameterised and bounded at this depth; host tooling (`zk/tools/revocation_depth.py`,
 verifier codec) rejects oversized depth before proving so hostile trees cannot
 inflate witness size or proving cost at this boundary. Depth changes require a
 new circuit version.
@@ -637,6 +637,7 @@ must be reconciled against on-chain data for any security-sensitive decision.
 | Mitigation | Location |
 |------------|----------|
 | Seeds are encrypted in `localStorage` via AES-GCM and PBKDF2 | `credentialVault.ts` → `setup` |
+| Imported and stored vault envelopes are bounded (`MAX_VAULT_ENVELOPE_BYTES` = 16 KiB, `MAX_VAULT_CIPHERTEXT_BYTES` = 4 KiB) before ciphertext decoding or PBKDF2 key derivation; failed imports preserve the existing encrypted vault | `credentialVault.ts` → `parseVaultEnvelope`, `importEnvelope`, `unlock` |
 | Vault automatically locks after 15 minutes of inactivity | `credentialVault.ts` → `resetTimeout` |
 | Explicit zeroization when locking or destroying the vault | `credentialVault.ts` → `lock`, `destroy` |
 | Only the encrypted envelope is persisted, not plaintext seeds | `safeStorage.ts` |

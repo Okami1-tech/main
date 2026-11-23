@@ -1,6 +1,7 @@
 import type { ChainProofRecord } from './stellar'
 import { verifyArtifact, type VerificationEvent } from './verificationFlow'
 import type { ProofManifest } from './proofManifest'
+import { appConfig } from './config'
 
 export type BatchOutcome =
   | 'pending'
@@ -28,8 +29,31 @@ export type BatchConfig = {
   wallet?: string
 }
 
+/**
+ * Explicit input descriptor binding a selected File to a caller-supplied
+ * identity and zero-based selection index so batch results remain stably
+ * ordered across concurrent completions and subset retries.
+ */
+export type BatchInputItem = {
+  /** Stable identifier for the selected input (auto-generated when omitted). */
+  id?: string
+  /** Zero-based position in the original selected input list (defaults to array index). */
+  inputIndex?: number
+  /** Selected evidence File or standalone JSON proof manifest. */
+  file: File
+}
+
+/**
+ * Accepted input entry for {@link BatchVerifier.runBatch}: either a raw `File`
+ * (indexed by its array position) or a {@link BatchInputItem} with an explicit
+ * original input identity.
+ */
+export type BatchInput = File | BatchInputItem
+
 export type BatchItemResult = {
   id: string
+  /** Zero-based position of this item in the original selected input list. */
+  inputIndex?: number
   file: File
   fileName: string
   fileSizeBytes: number
@@ -75,8 +99,8 @@ export const DEFAULT_BATCH_CONFIG: BatchConfig = {
   maxConcurrency: 3,
   maxFileSizeBytes: 100 * 1024 * 1024, // 100 MB
   maxTotalSizeBytes: 500 * 1024 * 1024, // 500 MB
-  apiBase: import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:5050',
-  contractId: import.meta.env.VITE_HARPOCRATES_REGISTRY_ID ?? '',
+  apiBase: appConfig.apiBase,
+  contractId: appConfig.registryId,
 }
 
 /**
@@ -100,7 +124,7 @@ export async function computeChunkedSha256(
     return hex(digest)
   }
 
-  // For larger files, read in chunks to allow responsive cancellation and avoid UI freeze
+  // For larger files, read in chunks to allow responsive cancellation and avoid UI hide
   let offset = 0
   const chunks: Uint8Array[] = []
   let totalRead = 0
@@ -166,15 +190,51 @@ export async function tryParseManifest(file: File): Promise<ProofManifest | null
 }
 
 /**
- * Worker pool class for managing batch verification with bounded concurrency
- * and resource safety.
+ * Returns a new array of batch results ordered by their original selected
+ * `inputIndex`, never by asynchronous completion order or duration.
+ *
+ * Items carrying a finite `inputIndex` are placed first in ascending order
+ * (with ties broken by relative array position); legacy items without a finite
+ * `inputIndex` preserve their relative array position afterwards.
+ */
+export function orderBatchResults(results: readonly BatchItemResult[]): BatchItemResult[] {
+  return results
+    .map((item, position) => ({ item, position }))
+    .sort((a, b) => {
+      const aHasIndex =
+        typeof a.item.inputIndex === 'number' && Number.isFinite(a.item.inputIndex)
+      const bHasIndex =
+        typeof b.item.inputIndex === 'number' && Number.isFinite(b.item.inputIndex)
+
+      if (aHasIndex && bHasIndex) {
+        const diff = (a.item.inputIndex as number) - (b.item.inputIndex as number)
+        if (diff !== 0) return diff
+        return a.position - b.position
+      }
+      if (aHasIndex) return -1
+      if (bHasIndex) return 1
+      return a.position - b.position
+    })
+    .map(({ item }) => item)
+}
+
+type HashClaim = {
+  owner: BatchItemResult
+  duplicates: BatchItemResult[]
+  verificationPromise: Promise<void>
+}
+
+/**
+ * Worker pool class for managing batch verification with bounded concurrency,
+ * resource safety, and stable input-order result association regardless of
+ * asynchronous completion order.
  */
 export class BatchVerifier {
   private config: BatchConfig
   private items: BatchItemResult[] = []
   private abortController: AbortController | null = null
   private onProgressCallback?: (progress: BatchProgress, items: BatchItemResult[]) => void
-  private processedHashes = new Map<string, string>() // videoHash -> itemId
+  private hashClaims = new Map<string, HashClaim>()
   private accumulatedTotalBytes = 0
 
   constructor(config: Partial<BatchConfig> = {}) {
@@ -190,7 +250,7 @@ export class BatchVerifier {
   }
 
   public getItems(): BatchItemResult[] {
-    return [...this.items]
+    return this.snapshotItems()
   }
 
   public setOnProgress(cb: (progress: BatchProgress, items: BatchItemResult[]) => void): void {
@@ -211,8 +271,16 @@ export class BatchVerifier {
     this.notifyProgress(true, true)
   }
 
+  /**
+   * Verifies a batch of selected files or {@link BatchInputItem} descriptors
+   * with bounded concurrency.
+   *
+   * Results delivered to `onProgress` and returned on resolution are always
+   * associated with their original selected input identities (`id` and
+   * `inputIndex`) and ordered by `inputIndex`, never by worker completion order.
+   */
   public async runBatch(
-    files: File[],
+    inputs: readonly BatchInput[],
     onProgress?: (progress: BatchProgress, items: BatchItemResult[]) => void,
   ): Promise<{ items: BatchItemResult[]; summary: BatchSummary }> {
     if (onProgress) {
@@ -222,15 +290,23 @@ export class BatchVerifier {
     this.abortController = new AbortController()
     const signal = this.abortController.signal
 
-    // Initialize item results
+    // Initialize item results bound to their original selected input identities
     const startTime = performance.now()
-    this.processedHashes.clear()
+    this.hashClaims.clear()
     this.accumulatedTotalBytes = 0
 
-    this.items = files.map((file, idx) => {
-      const id = `item-${idx}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+    const batchNonce = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+    const initialItems: BatchItemResult[] = inputs.map((entry, idx) => {
+      const isFile = entry instanceof File
+      const file = isFile ? entry : entry.file
+      const inputIndex =
+        !isFile && typeof entry.inputIndex === 'number' && Number.isFinite(entry.inputIndex)
+          ? entry.inputIndex
+          : idx
+      const id = !isFile && entry.id ? entry.id : `item-${idx}-${batchNonce}`
       return {
         id,
+        inputIndex,
         file,
         fileName: file.name,
         fileSizeBytes: file.size,
@@ -249,6 +325,8 @@ export class BatchVerifier {
         failureReason: null,
       }
     })
+
+    this.items = orderBatchResults(initialItems)
 
     this.notifyProgress(false, false)
 
@@ -278,7 +356,7 @@ export class BatchVerifier {
     this.accumulatedTotalBytes = currentBatchBytes
     this.notifyProgress(false, false)
 
-    // Execute with bounded concurrency
+    // Execute with bounded concurrency while writing back to fixed input slots
     const queue = this.items.filter((item) => item.status === 'pending')
     const concurrency = Math.max(1, Math.min(8, this.config.maxConcurrency))
 
@@ -289,7 +367,7 @@ export class BatchVerifier {
         if (!item) break
 
         await this.processItem(item, signal)
-        this.notifyProgress(false, queue.length === 0)
+        this.notifyProgress(false, false)
       }
     }
 
@@ -311,7 +389,7 @@ export class BatchVerifier {
     const summary = this.computeSummary(endTime - startTime)
     this.notifyProgress(signal.aborted, true)
 
-    return { items: [...this.items], summary }
+    return { items: this.snapshotItems(), summary }
   }
 
   private async processItem(item: BatchItemResult, signal: AbortSignal): Promise<void> {
@@ -376,19 +454,86 @@ export class BatchVerifier {
         return
       }
 
-      // Duplicate Check
-      if (this.processedHashes.has(videoHash)) {
-        const existingId = this.processedHashes.get(videoHash)!
-        const originalItem = this.items.find((i) => i.id === existingId)
-        item.status = 'duplicate'
-        item.duplicateOf = originalItem ? originalItem.fileName : existingId
-        item.message = `Duplicate file detected (identical hash to ${item.duplicateOf}).`
-        item.durationMs = performance.now() - itemStart
+      // Duplicate Check — deterministic by original inputIndex, not completion order
+      const existingClaim = this.hashClaims.get(videoHash)
+      if (existingClaim) {
+        if (this.compareInputOrder(item, existingClaim.owner) < 0) {
+          // An item with a later inputIndex hashed first; await its single
+          // verification pass and transfer canonical ownership to this earlier item.
+          await existingClaim.verificationPromise
+          if (signal.aborted) {
+            item.status = 'cancelled'
+            item.message = 'Cancelled.'
+            item.failureReason = 'Batch execution was aborted by user request.'
+            item.durationMs = performance.now() - itemStart
+            return
+          }
+          if (this.compareInputOrder(item, existingClaim.owner) < 0) {
+            const previousOwner = existingClaim.owner
+            item.videoHash = previousOwner.videoHash ?? videoHash
+            item.metadataHash = previousOwner.metadataHash
+            item.sourceHash = previousOwner.sourceHash
+            item.tier = previousOwner.tier
+            item.chainProof = previousOwner.chainProof
+            item.chainStatus = previousOwner.chainStatus
+            item.status = previousOwner.status
+            item.message = previousOwner.message
+            item.events = [...previousOwner.events]
+            item.failureReason = previousOwner.failureReason
+            item.duplicateOf = null
+            item.durationMs = performance.now() - itemStart
+
+            previousOwner.metadataHash = null
+            previousOwner.sourceHash = null
+            previousOwner.tier = null
+            previousOwner.chainProof = null
+            previousOwner.chainStatus = null
+            previousOwner.events = []
+            previousOwner.failureReason = null
+            existingClaim.duplicates.push(previousOwner)
+            existingClaim.owner = item
+
+            for (const dup of existingClaim.duplicates) {
+              dup.status = 'duplicate'
+              dup.duplicateOf = item.fileName
+              dup.message = `Duplicate file detected (identical hash to ${item.fileName}).`
+            }
+            return
+          }
+        }
+
+        this.markAsDuplicate(item, existingClaim.owner, itemStart)
+        existingClaim.duplicates.push(item)
         return
       }
 
-      this.processedHashes.set(videoHash, item.id)
+      const verificationPromise = this.runVerification(item, signal, itemStart)
+      this.hashClaims.set(videoHash, {
+        owner: item,
+        duplicates: [],
+        verificationPromise,
+      })
+      await verificationPromise
+    } catch (err) {
+      if (signal.aborted) {
+        item.status = 'cancelled'
+        item.message = 'Cancelled.'
+        item.failureReason = 'Batch execution was aborted by user request.'
+      } else {
+        item.status = 'error'
+        item.message = err instanceof Error ? err.message : 'Unknown error.'
+        item.failureReason = item.message
+      }
+      item.durationMs = performance.now() - itemStart
+    }
+  }
 
+  private async runVerification(
+    item: BatchItemResult,
+    signal: AbortSignal,
+    itemStart: number,
+  ): Promise<void> {
+    try {
       // Verification Flow
       item.status = 'processing'
       item.message = 'Extracting stego metadata and checking Stellar registry...'
@@ -397,46 +542,91 @@ export class BatchVerifier {
       const result = await verifyArtifact({
         apiBase: this.config.apiBase,
         contractId: this.config.contractId,
-        file: item.file,
-        videoHash,
         wallet: this.config.wallet,
+        file: item.file,
+        videoHash: item.videoHash ?? '',
         signal,
       })
 
-      if (signal.aborted) {
-        item.status = 'cancelled'
-        item.message = 'Cancelled during verification.'
-        return
-      }
-
+      item.events = [...result.events]
+      item.chainProof = result.chainProof ?? null
+      item.chainStatus = result.chainProof
+        ? result.chainProof.status === 2
+          ? 'Revoked'
+          : 'Active'
+        : null
+      item.metadataHash = result.chainProof?.metadataHash ?? null
+      item.sourceHash = null
+      item.tier = result.events[0]?.tier ?? null
       item.status = result.outcome
       item.message = result.message
-      item.events = result.events
-      item.chainProof = result.chainProof
-      if (result.chainProof) {
-        item.tier = String(result.chainProof.tier)
-        item.metadataHash = result.chainProof.metadataHash
-        item.chainStatus = result.chainProof.status === 2 ? 'Revoked' : 'Active'
-      }
-
-      if (result.outcome === 'malformed') {
-        item.failureReason = 'Embedded Harpocrates stego metadata missing or corrupted.'
-      } else if (result.outcome === 'unavailable') {
-        item.failureReason = 'Stego extraction backend or Soroban RPC network unavailable.'
-      }
+      item.failureReason =
+        result.outcome === 'malformed' ||
+        result.outcome === 'unavailable' ||
+        result.outcome === 'revoked'
+          ? result.message
+          : null
+      item.durationMs = performance.now() - itemStart
     } catch (err) {
-      if (signal.aborted || (err instanceof Error && err.message.includes('cancelled'))) {
+      if (signal.aborted) {
         item.status = 'cancelled'
-        item.message = 'Cancelled by user.'
-        item.failureReason = 'Batch execution aborted.'
+        item.message = 'Cancelled.'
+        item.failureReason = 'Batch execution was aborted by user request.'
       } else {
         item.status = 'error'
-        item.message = err instanceof Error ? err.message : 'Unknown verification failure.'
+        item.message = err instanceof Error ? err.message : 'Unknown error.'
         item.failureReason = item.message
       }
-    } finally {
       item.durationMs = performance.now() - itemStart
     }
+  }
+
+  private compareInputOrder(a: BatchItemResult, b: BatchItemResult): number {
+    const aIdx = typeof a.inputIndex === 'number' && Number.isFinite(a.inputIndex) ? a.inputIndex : Number.MAX_SAFE_INTEGER
+    const bIdx = typeof b.inputIndex === 'number' && Number.isFinite(b.inputIndex) ? b.inputIndex : Number.MAX_SAFE_INTEGER
+    if (aIdx !== bIdx) return aIdx - bIdx
+    return this.items.indexOf(a) - this.items.indexOf(b)
+  }
+
+  private markAsDuplicate(item: BatchItemResult, originalItem: BatchItemResult, itemStart: number): void {
+    item.status = 'duplicate'
+    item.duplicateOf = originalItem.fileName
+    item.message = `Duplicate file detected (identical hash to ${item.duplicateOf}).`
+    item.durationMs = performance.now() - itemStart
+  }
+
+  private snapshotItems(): BatchItemResult[] {
+    return orderBatchResults(this.items).map((item) => ({
+      ...item,
+      events: [...item.events],
+    }))
+  }
+
+  private notifyProgress(isCancelled: boolean, isDone: boolean): void {
+    if (!this.onProgressCallback) return
+    const totalFiles = this.items.length
+    const completedFiles = this.items.filter(
+      (i) => i.status !== 'pending' && i.status !== 'hashing' && i.status !== 'processing',
+    ).length
+    const activeCount = this.items.filter(
+      (i) => i.status === 'hashing' || i.status === 'processing',
+    ).length
+    const processedBytes = this.items.reduce((acc, i) => {
+      if (i.status === 'pending' || i.status === 'hashing') return acc
+      return acc + i.fileSizeBytes
+    }, 0)
+    this.onProgressCallback(
+      {
+        totalFiles,
+        completedFiles,
+        processedBytes,
+        totalBytes: this.accumulatedTotalBytes,
+        activeCount,
+        isCancelled,
+        isDone,
+      },
+      this.snapshotItems(),
+    )
   }
 
   private computeSummary(durationMs: number): BatchSummary {
@@ -449,11 +639,12 @@ export class BatchVerifier {
       duplicates: 0,
       errors: 0,
       cancelled: 0,
-      totalBytes: this.items.reduce((acc, item) => acc + item.fileSizeBytes, 0),
+      totalBytes: 0,
       durationMs,
     }
 
     for (const item of this.items) {
+      summary.totalBytes += item.fileSizeBytes
       switch (item.status) {
         case 'confirmed':
           summary.confirmed++
@@ -461,55 +652,28 @@ export class BatchVerifier {
         case 'revoked':
           summary.revoked++
           break
-        case 'metadata-only':
-        case 'database-only':
-          summary.unconfirmed++
-          break
         case 'manifest-valid':
+        case 'manifest-invalid':
           summary.manifests++
           break
         case 'duplicate':
           summary.duplicates++
           break
-        case 'oversized':
-        case 'malformed':
-        case 'manifest-invalid':
-        case 'error':
-          summary.errors++
-          break
         case 'cancelled':
           summary.cancelled++
+          break
+        case 'error':
+        case 'malformed':
+        case 'oversized':
+        case 'unavailable':
+          summary.errors++
+          break
+        default:
+          summary.unconfirmed++
           break
       }
     }
 
     return summary
-  }
-
-  private notifyProgress(isCancelled: boolean, isDone: boolean): void {
-    if (!this.onProgressCallback) return
-
-    const totalFiles = this.items.length
-    const completedFiles = this.items.filter(
-      (item) => item.status !== 'pending' && item.status !== 'hashing' && item.status !== 'processing',
-    ).length
-    const activeCount = this.items.filter(
-      (item) => item.status === 'hashing' || item.status === 'processing',
-    ).length
-    const processedBytes = this.items
-      .filter((item) => item.status !== 'pending')
-      .reduce((acc, item) => acc + item.fileSizeBytes, 0)
-
-    const progress: BatchProgress = {
-      totalFiles,
-      completedFiles,
-      processedBytes,
-      totalBytes: this.accumulatedTotalBytes || this.items.reduce((acc, i) => acc + i.fileSizeBytes, 0),
-      activeCount,
-      isCancelled,
-      isDone: isDone || completedFiles === totalFiles,
-    }
-
-    this.onProgressCallback(progress, [...this.items])
   }
 }

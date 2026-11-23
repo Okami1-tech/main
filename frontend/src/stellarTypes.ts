@@ -117,6 +117,37 @@ export type ProofHistoryResult = {
   count: number
 }
 
+export type AuthorityRole = 1 | 2 | 3
+
+export type AuthorityTransition =
+  | 1 // Initialized
+  | 2 // Proposed
+  | 3 // Cancelled
+  | 4 // Accepted
+  | 5 // Added
+  | 6 // Revoked
+  | 7 // Rotated
+  | 8 // Finalized
+  | 9 // MetadataUpdated
+  | 10 // ConflictRevoked
+
+export type AuthorityHistoryEntry = {
+  reference: number
+  ledgerTimestamp: string
+  approver: string
+  role: AuthorityRole
+  transition: AuthorityTransition
+  actor: string | null
+  metadataHash: string | null
+}
+
+export type AuthorityHistoryPage = {
+  entries: AuthorityHistoryEntry[]
+  nextOffset: number
+  nextCursor: number | null
+  total: number
+}
+
 /**
  * `IssuerRecord` from the registry: an institutional issuer's standing.
  * `active` is the registry's own flag, so revocation is authoritative here
@@ -151,41 +182,21 @@ export type RegistryMethod =
   | 'register_seal'
   | 'get_by_video'
   | 'get_issuer'
+  | 'get_proof_history'
   | 'get_proof_history_at'
   | 'get_proof_history_count'
+  | 'get_institutional_authority_history'
+  | 'get_authority_history'
+  | 'get_approver_authority_history'
+  | 'get_authority_history_at'
+  | 'get_authority_history_count'
+  | 'get_approver_authority_history_count'
   | 'set_scope_epoch'
   | 'get_scope_epoch'
   | 'add_schema'
   | 'get_schema'
   | 'get_verifier_state'
-
-export type ProofHistoryEntry = {
-  action: number
-  timestamp: string
-  actor: string | null
-  reasonCode: number
-}
-
-export type ProofHistoryResult = {
-  entries: ProofHistoryEntry[]
-  count: number
-}
-
-export type ProofHistoryEntry = {
-  /** Registry action code (see the contract's HistoryAction enum). */
-  action: number
-  /** Ledger sequence / timestamp captured at the time of the action. */
-  timestamp: string
-  /** Actor address that triggered the action, if recorded. */
-  actor: string | null
-  /** Reason code attached to the action. */
-  reasonCode: number
-}
-
-export type ProofHistoryResult = {
-  entries: ProofHistoryEntry[]
-  count: number
-}
+  | 'get_open_dispute_count'
 
 export type ScopedProofScope = {
   /** Field element derived from the scope string (SHA-256 mod BN254). */
